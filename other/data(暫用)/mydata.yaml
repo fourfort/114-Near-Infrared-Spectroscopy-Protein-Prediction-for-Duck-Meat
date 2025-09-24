@@ -1,0 +1,21 @@
+root: "D:/Users/wedke/document/extra document/大三上/113專題研究之製作/論文人生/紅外線/red_coding main/data"
+num_classes: 3
+class_names: ["broken", "dirty", "normal"]
+
+train:
+  images: "${root}/train/images"
+  annotations: "${root}/train/_annotations.coco_fixed.json"
+  image_size: [640, 640]
+  batch_size: 16
+
+val:
+  images: "${root}/valid/images"
+  annotations: "${root}/valid/_annotations.coco_fixed.json"
+  image_size: [640, 640]
+  batch_size: 16
+
+test:
+  images: "${root}/test/images"
+  annotations: "${root}/test/_annotations.coco_fixed.json"
+  image_size: [640, 640]
+  batch_size: 16

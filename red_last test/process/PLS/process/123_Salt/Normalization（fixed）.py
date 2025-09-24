@@ -1,0 +1,432 @@
+import pandas as pd
+import numpy as np
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from scipy.stats import chi2
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from sklearn.metrics import pairwise_distances
+from datetime import datetime
+import os
+
+# 定義統一參數
+PARAMS = {
+    'WAVELENGTH_RANGE': (750, 1200),  # 波長範圍 (min, max)
+    'WAVELENGTH_RANGE_STR': '850-1099.5',  # 波長範圍字串表示
+    'MCS_N_ITERATIONS': 1000,  # MCS 抽樣次數
+    'MCS_N_COMPONENTS': 7,  # MCS PLS 主成分數
+    'MAHALANOBIS_THRESHOLD': 90,  # 馬氏距離閾值 (%)
+    'TRAIN_TEST_RATIO': 0.25,  # 測試集比例 (0.35 表示 65:35)
+    'TRAIN_TEST_RATIO_STR': '65:35',  # 訓練-測試比例字串表示
+}
+
+# 設置 Times New Roman 字體，帶回退機制
+font_path = fm.findfont(fm.FontProperties(family='Times New Roman'))
+if font_path:
+    plt.rcParams['font.family'] = 'Times New Roman'
+else:
+    print("⚠️ Times New Roman not found, using DejaVu Sans")
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['font.size'] = 12
+
+# 自定義 R² 計算函數，處理變異為零的情況
+def safe_r2_score(y_true, y_pred):
+    if len(y_true) <= 1 or np.var(y_true) == 0:
+        print("⚠️ R² calculation skipped due to insufficient data or zero variance")
+        return np.nan
+    return r2_score(y_true, y_pred)
+
+# 歸一化（Normalization）預處理函數
+def normalize(X):
+    X = np.array(X)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1  # 防止除以零
+    X_norm = X / norms
+    return X_norm
+
+# === 步驟 1: 數據獲取與處理 ===
+try:
+    nir_df = pd.read_csv(r'nir_data.csv')
+    print("✅ nir_data.csv 前五行:")
+    print(nir_df.head())
+except FileNotFoundError:
+    print("❌ 無法找到 nir_data.csv，請確認檔案存在於指定路徑。")
+    exit()
+
+try:
+    trad_df = pd.read_excel(r'trad_data.xlsx')
+    print("\n✅ trad_data.xlsx 前五行:")
+    print(trad_df.head())
+except FileNotFoundError:
+    print("❌ 無法找到 trad_data.xlsx，請確認檔案存在於指定路徑。")
+    exit()
+
+# 檢查缺失值並移除 Sample Number 缺失的樣本
+print("\n🔍 NIR 缺失值檢查:\n", nir_df.isnull().sum())
+print("\n🔍 傳統分析缺失值檢查:\n", trad_df.isnull().sum())
+
+# 自動偵測樣本編號欄位名稱
+def find_sample_column(df, name='nir'):
+    for col in df.columns:
+        if 'sample number' in col.lower() or 'sample no' in col.lower():
+            print(f"✅ 在 {name} 資料中找到樣本編號欄位: {col}")
+            return col
+    print(f"⚠️ {name} 資料中未找到樣本編號欄位")
+    return None
+
+nir_sample_col = find_sample_column(nir_df, 'NIR')
+trad_sample_col = find_sample_column(trad_df, '傳統分析')
+
+# 若 NIR 缺少樣本編號欄，生成編號
+if not nir_sample_col:
+    nir_sample_col = 'Sample_Number'
+    nir_df[nir_sample_col] = [f'1-{i+1}' for i in range(len(nir_df))]
+
+# 處理光譜資料（波長範圍）
+nir_df.columns = ['Wavelength'] + [f'1-{i}' for i in range(1, len(nir_df.columns))]
+nir_df = nir_df.drop(0).reset_index(drop=True)
+nir_df['Wavelength'] = nir_df['Wavelength'].astype(float)
+nir_filtered_df = nir_df[(nir_df['Wavelength'] >= PARAMS['WAVELENGTH_RANGE'][0]) & 
+                        (nir_df['Wavelength'] <= PARAMS['WAVELENGTH_RANGE'][1])]
+selected_columns = ['Wavelength'] + [col for col in nir_df.columns if col != 'Wavelength']
+nir_final_df = nir_filtered_df[selected_columns]
+print(f"✅ 過濾後 NIR 數據波長範圍: {nir_final_df['Wavelength'].min()} - {nir_final_df['Wavelength'].max()}, 共 {len(nir_final_df)} 個波長點")
+if len(nir_final_df) != 500:
+    print(f"⚠️ 波長點數 {len(nir_final_df)} 不等於預期 500，檢查數據格式")
+
+# 對齊樣本
+if trad_sample_col:
+    trad_df[trad_sample_col] = [f'1-{i+1}' for i in range(len(trad_df))]
+else:
+    print("⚠️ 無法進行樣本對齊，缺少樣本編號欄")
+    exit()
+
+if 'Salt' in trad_df.columns:
+    trad_df = trad_df.dropna(subset=['Salt'])
+    Y = trad_df['Salt'].values
+    print("\n🎯 目標值 Y 前五筆:", Y[:5])
+    print("\n🎯 目標值 Y 描述:", pd.Series(Y).describe())
+else:
+    print("❌ 缺少 'Salt' 欄位，無法建立模型")
+    exit()
+
+nir_transposed_df = nir_final_df.set_index('Wavelength').T
+nir_transposed_df = nir_transposed_df.apply(pd.to_numeric, errors='coerce')
+nir_transposed_df = nir_transposed_df.dropna(axis=1)
+print("\n✅ 轉換後 NIR 資料形狀:", nir_transposed_df.shape)
+
+sample_ids = trad_df[trad_sample_col].astype(str).tolist()
+nir_transposed_df.index = nir_transposed_df.index.astype(str)
+common_ids = list(set(sample_ids).intersection(set(nir_transposed_df.index)))
+if len(common_ids) != len(sample_ids) or len(common_ids) != len(Y):
+    print(f"❌ 對齊後樣本數不一致：X: {len(common_ids)}, Y: {len(Y)}")
+    trad_df = trad_df[trad_df[trad_sample_col].astype(str).isin(common_ids)]
+    Y = trad_df['Salt'].values
+    X = nir_transposed_df.loc[common_ids]
+else:
+    X = nir_transposed_df.loc[sample_ids]
+print(f"✅ 成功對齊資料，樣本數: {X.shape[0]}")
+
+# === 步驟 2: 去除異常值 ===
+# 馬氏距離法
+pca = PCA(n_components=min(X.shape[0], X.shape[1], 20))
+X_pca = pca.fit_transform(X)
+print(f"✅ PCA 降維後資料形狀: {X_pca.shape}")
+
+def mahalanobis_distance(X):
+    cov_matrix = np.cov(X, rowvar=False)
+    cov_matrix += np.eye(cov_matrix.shape[0]) * 1e-6
+    try:
+        cov_inv = np.linalg.inv(cov_matrix)
+    except np.linalg.LinAlgError:
+        print("❌ 協方差矩陣無法求逆，嘗試進一步正則化")
+        cov_matrix += np.eye(cov_matrix.shape[0]) * 1e-3
+        cov_inv = np.linalg.inv(cov_matrix)
+    mean = np.mean(X, axis=0)
+    md = np.sqrt(np.sum((X - mean) @ cov_inv * (X - mean), axis=1))
+    return md
+
+n_simulations = PARAMS['MCS_N_ITERATIONS']
+np.random.seed(42)
+md_thresholds = []
+for _ in range(n_simulations):
+    sim_data = np.random.multivariate_normal(np.mean(X_pca, axis=0), np.cov(X_pca, rowvar=False), size=X_pca.shape[0])
+    cov_sim = np.cov(sim_data, rowvar=False)
+    if np.any(np.isnan(cov_sim)) or np.any(np.isinf(cov_sim)):
+        print("⚠️ 模擬數據協方差矩陣包含無效值")
+        continue
+    md_sim = mahalanobis_distance(sim_data)
+    md_thresholds.append(np.percentile(md_sim, PARAMS['MAHALANOBIS_THRESHOLD']))
+md_threshold = np.mean(md_thresholds)
+
+md = mahalanobis_distance(X_pca)
+mask_md = md < md_threshold
+print(f"✅ 馬氏距離法檢測到 {np.sum(~mask_md)} 個異常值，剩餘樣本數：{np.sum(mask_md)}")
+
+# 蒙特卡洛採樣（MCS）異常值檢測
+def monte_carlo_outlier_detection(X, y, n_iterations=PARAMS['MCS_N_ITERATIONS'], 
+                                 sample_ratio=0.8, n_components=PARAMS['MCS_N_COMPONENTS'], 
+                                 threshold_percentile=95):
+    n_samples = X.shape[0]
+    n_subset = int(n_samples * sample_ratio)
+    residuals = np.zeros(n_samples)
+    
+    for _ in range(n_iterations):
+        indices = np.random.choice(n_samples, n_subset, replace=False)
+        X_subset = X.iloc[indices] if isinstance(X, pd.DataFrame) else X[indices]
+        y_subset = y[indices]
+        
+        scaler = StandardScaler()
+        X_subset_scaled = scaler.fit_transform(X_subset)
+        
+        pls = PLSRegression(n_components=min(n_components, X_subset_scaled.shape[1], n_subset))
+        pls.fit(X_subset_scaled, y_subset)
+        
+        X_scaled = scaler.transform(X)
+        y_pred = pls.predict(X_scaled).ravel()
+        residuals += (y - y_pred) ** 2
+    
+    residuals = residuals / n_iterations
+    threshold = np.percentile(residuals, threshold_percentile)
+    mask_mcs = residuals < threshold
+    print(f"✅ MCS 檢測到 {np.sum(~mask_mcs)} 個異常值，剩餘樣本數：{np.sum(mask_mcs)}")
+    return mask_mcs
+
+# 結合馬氏距離和 MCS（交集）
+scaler_y_temp = StandardScaler()
+Y_scaled_temp = scaler_y_temp.fit_transform(Y.reshape(-1, 1)).ravel()
+mask_mcs = monte_carlo_outlier_detection(X, Y_scaled_temp)
+mask = mask_md & mask_mcs
+X = X[mask]
+Y = Y[mask]
+print(f"✅ 結合馬氏距離和 MCS 後，剩餘樣本數：{X.shape[0]}")
+print(f"✅ 剔除後目標值 Y 描述:", pd.Series(Y).describe())
+
+# 鹽含量範圍檢查（0-50%）
+salt_mask = (Y >= 0) & (Y <= 50)
+if not np.all(salt_mask):
+    print(f"⚠️ 檢測到鹽含量異常值（應在 0-50%）：{Y[~salt_mask]}")
+    X = X[salt_mask]
+    Y = Y[salt_mask]
+    print(f"✅ 移除鹽含量異常值後，剩餘樣本數：{X.shape[0]}")
+    print(f"✅ 移除後目標值 Y 描述:", pd.Series(Y).describe())
+
+# 繪製鹽含量分佈直方圖
+plt.figure(figsize=(8, 6))
+plt.hist(Y, bins=20, edgecolor='black', alpha=0.7)
+plt.xlabel('Salt Content (%)', fontsize=14)
+plt.ylabel('Frequency', fontsize=14)
+plt.title('Distribution of Salt Content', fontsize=16, pad=10)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# === 步驟 3: NIR 光譜標準化 ===
+scaler_x = StandardScaler()
+X_scaled = scaler_x.fit_transform(X)
+X = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+print("✅ NIR 光譜標準化完成")
+
+def spxy(X, Y, test_size=PARAMS['TRAIN_TEST_RATIO']):
+    # 保留原始索引
+    if isinstance(X, pd.DataFrame):
+        indices = X.index
+        columns = X.columns
+        X = np.array(X)
+    else:
+        indices = np.arange(X.shape[0])
+        columns = None
+    
+    Y = np.array(Y).reshape(-1, 1)
+    n_samples = X.shape[0]
+    n_test = int(np.floor(test_size * n_samples))
+
+    dist_X = pairwise_distances(X)
+    dist_Y = pairwise_distances(Y)
+    dist_XY = dist_X + dist_Y
+
+    selected = []
+    remaining = list(range(n_samples))
+
+    i1, i2 = np.unravel_index(np.argmax(dist_XY), dist_XY.shape)
+    selected.extend([i1, i2])
+    remaining.remove(i1)
+    remaining.remove(i2)
+
+    while len(selected) < n_samples - n_test:
+        min_distances = np.min(dist_XY[remaining][:, selected], axis=1)
+        next_index = remaining[np.argmax(min_distances)]
+        selected.append(next_index)
+        remaining.remove(next_index)
+
+    selected = np.array(selected)
+    remaining = np.array(remaining)
+
+    X_train = X[selected]
+    Y_train = Y[selected].ravel()
+    X_test = X[remaining]
+    Y_test = Y[remaining].ravel()
+
+    # 轉為 DataFrame，保留索引和欄名
+    X_train = pd.DataFrame(X_train, index=indices[selected], columns=columns)
+    X_test = pd.DataFrame(X_test, index=indices[remaining], columns=columns)
+
+    return X_train, X_test, Y_train, Y_test
+
+# 在主程式中調用
+scaler_y = StandardScaler()
+Y_scaled = scaler_y.fit_transform(Y.reshape(-1, 1)).ravel()
+X_train, X_test, Y_train, Y_test = spxy(X, Y_scaled)
+
+print(f"✅ SPXY 訓練集形狀: {X_train.shape}, 測試集形狀: {X_test.shape}")
+print(f"✅ 訓練集目標值 Y 描述:", pd.Series(scaler_y.inverse_transform(Y_train.reshape(-1, 1)).ravel()).describe())
+print(f"✅ 測試集目標值 Y 描述:", pd.Series(scaler_y.inverse_transform(Y_test.reshape(-1, 1)).ravel()).describe())
+
+# 正規化
+X_train_norm = normalize(X_train)
+X_train = pd.DataFrame(X_train_norm, columns=X.columns, index=X_train.index)
+X_test_norm = normalize(X_test)
+X_test = pd.DataFrame(X_test_norm, columns=X.columns, index=X_test.index)
+print("✅ NIR 光譜 Normalization 完成")
+
+# === 步驟 6: 使用Normalization預處理之數據 ===
+X_train_selected = X_train
+X_test_selected = X_test
+print(f"✅ 使用Normalization 數據，訓練集形狀: {X_train_selected.shape}, 測試集形狀: {X_test_selected.shape}")
+
+# === 步驟 6: 交叉驗證找最佳 n_components ===
+max_lv = min(10, X_train_selected.shape[1], X_train_selected.shape[0])
+rmse_cv = []
+
+for lv in range(1, max_lv + 1):
+    pls_cv = PLSRegression(n_components=lv)
+    scores = cross_val_score(
+        pls_cv,
+        X_train_selected,
+        Y_train,
+        cv=KFold(n_splits=5, shuffle=True, random_state=42),
+        scoring='neg_root_mean_squared_error'
+    )
+    rmse_cv.append(-scores.mean())
+
+best_lv = np.argmin(rmse_cv) + 1
+print(f"🔍 使用交叉驗證選擇最佳潛在變數數量為: {best_lv}")
+
+# === 步驟 7: 模型訓練（使用最佳 n_components） ===
+pls = PLSRegression(n_components=best_lv)
+pls.fit(X_train_selected, Y_train)
+print(f"✅ 模型訓練完成，使用的潛在變數數量 (n_components): {best_lv}")
+
+# === 步驟 8: 評估結果 ===
+Y_train_pred_scaled = pls.predict(X_train_selected)
+Y_test_pred_scaled = pls.predict(X_test_selected)
+Y_train_pred = scaler_y.inverse_transform(Y_train_pred_scaled.reshape(-1, 1)).ravel()
+Y_test_pred = scaler_y.inverse_transform(Y_test_pred_scaled.reshape(-1, 1)).ravel()
+Y_train_original = scaler_y.inverse_transform(Y_train.reshape(-1, 1)).ravel()
+Y_test_original = scaler_y.inverse_transform(Y_test.reshape(-1, 1)).ravel()
+
+train_mse = mean_squared_error(Y_train_original, Y_train_pred)
+test_mse = mean_squared_error(Y_test_original, Y_test_pred)
+train_rmse = np.sqrt(train_mse)
+test_rmse = np.sqrt(test_mse)
+train_r2 = safe_r2_score(Y_train_original, Y_train_pred)
+test_r2 = safe_r2_score(Y_test_original, Y_test_pred)
+
+n_train = len(Y_train)
+n_test = len(Y_test)
+sec = np.sqrt(np.sum((Y_train_original - Y_train_pred) ** 2) / max(1, n_train - best_lv - 1))
+sep = np.sqrt(np.sum((Y_test_original - Y_test_pred) ** 2) / (n_test - 1))
+
+# 5-fold 交叉驗證評估
+cv_scores = cross_val_score(pls, X_train_selected, Y_train, cv=5, scoring='r2')
+print(f"\n✅ 5-fold Cross-Validation R² Scores: {cv_scores}")
+print(f"✅ Mean CV R²: {cv_scores.mean():.4f} (± {cv_scores.std() * 2:.4f})")
+
+# 指標表格數據
+metrics_data = {
+    'Metric': ['MSE', 'RMSE', 'R² Score', 'SEC', 'SEP'],
+    'Training Set': [f'{train_mse:.4f}', f'{train_rmse:.4f}', f'{train_r2:.4f}', f'{sec:.4f}', 'N/A'],
+    'Test Set': [f'{test_mse:.4f}', f'{test_rmse:.4f}', f'{test_r2:.4f}', 'N/A', f'{sep:.4f}']
+}
+metrics_df = pd.DataFrame(metrics_data)
+print("\n✅ Evaluation Metrics:")
+print(metrics_df.to_string(index=False))
+
+# 繪製指標表格
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.axis('off')
+table = ax.table(cellText=metrics_df.values, colLabels=metrics_df.columns, cellLoc='center', loc='center')
+table.auto_set_font_size(False)
+table.set_fontsize(12)
+table.scale(1.2, 1.2)
+plt.title('Evaluation Metrics for Training and Test Sets (Salt)')
+plt.tight_layout()
+plt.show()
+
+# 繪製預測散點圖
+print(f"Test Set True Values Range: Min {Y_test_original.min():.2f}, Max {Y_test_original.max():.2f}")
+x_min = min(Y_test_original.min(), Y_train_original.min())
+x_max = max(Y_test_original.max(), Y_train_original.max())
+plt.figure(figsize=(6, 6))
+plt.scatter(Y_test_original, Y_test_pred, alpha=0.7, label='Predicted vs Actual')
+plt.plot([x_min, x_max], [x_min, x_max], 'r--', label='Ideal (y=x)')
+plt.xlim(x_min, x_max)
+plt.ylim(x_min, x_max)
+plt.xlabel('Actual Salt Content (%)')
+plt.ylabel('Predicted Salt Content (%)')
+plt.title('PLS Regression: Actual vs Predicted Salt')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === 步驟 9: 生成參數和指標的 Excel 檔案 ===
+# 統一參數
+common_params = {
+    'Wavelength Range (nm)': PARAMS['WAVELENGTH_RANGE_STR'],
+    'MCS Sampling Iterations': PARAMS['MCS_N_ITERATIONS'],
+    'MCS PLS Components': PARAMS['MCS_N_COMPONENTS'],
+    'Mahalanobis Distance Threshold (%)': PARAMS['MAHALANOBIS_THRESHOLD'],
+    'Train-Test Split Ratio': PARAMS['TRAIN_TEST_RATIO_STR'],
+}
+
+# 特有參數
+specific_params = {
+    'Optimal PLS Latent Variables': best_lv
+}
+
+# 評估指標
+eval_metrics = {
+    'RMSEC': f'{train_rmse:.4f}',
+    'RMSEP': f'{test_rmse:.4f}',
+    'R² C': f'{train_r2:.4f}',
+    'R² P': f'{test_r2:.4f}',
+    'SEC': f'{sec:.4f}',
+    'SEP': f'{sep:.4f}'
+}
+
+# 合併所有參數和指標
+output_data = {
+    'Parameter/Metric': list(common_params.keys()) + list(specific_params.keys()) + list(eval_metrics.keys()),
+    'Value': list(common_params.values()) + list(specific_params.values()) + list(eval_metrics.values()),
+    'Category': ['Common Parameters'] * len(common_params) + ['Specific Parameters'] * len(specific_params) + ['Evaluation Metrics'] * len(eval_metrics)
+}
+
+# 創建 DataFrame
+output_df = pd.DataFrame(output_data)
+
+# 生成帶時間戳的檔案名
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+base_filename = 'PLS_Salt_SPXY_Standardize_Normalize_NoCARS_NoSG'
+counter = 1
+output_filename = f'{base_filename}_{timestamp}_{counter}.xlsx'
+while os.path.exists(output_filename):
+    counter += 1
+    output_filename = f'{base_filename}_{timestamp}_{counter}.xlsx'
+
+# 輸出到 Excel
+output_df.to_excel(output_filename, index=False)
+print(f"✅ 已生成參數和指標檔案: {output_filename}")

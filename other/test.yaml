@@ -1,0 +1,13 @@
+ch: 3  # 輸入通道數
+num_classes: 3  # 分類數
+
+backbone:
+  - [-1, 1, BaseConv, [32, 3, 1]]  # [out_channels, kernel_size, stride]
+  - [-1, 1, BaseConv, [64, 1, 1]]
+  - [-1, 1, Bottleneck, [64]]
+  - [-1, 1, Bottleneck, [128]]
+
+head:
+  - [-1, 1, AdaptiveAvgPool2d, [[1, 1]]]
+  - [-1, 1, Flatten, []]
+  - [-1, 1, Linear, [-1, 3]]  # -1 表示自動使用 backbone 最後通道數，3 為分類數
