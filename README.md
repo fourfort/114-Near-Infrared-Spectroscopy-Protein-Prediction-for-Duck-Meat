@@ -1,0 +1,1 @@
+# 114-Near-Infrared-Spectroscopy-Protein-Prediction-for-Duck-Meat
