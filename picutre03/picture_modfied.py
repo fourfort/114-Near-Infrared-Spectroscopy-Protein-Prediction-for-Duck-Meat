@@ -1,11 +1,11 @@
 from PIL import Image
 
 # === 1. 開啟影像 ===
-img = Image.open(r"D:\Users\wedke\document\extra document\大三上\113專題研究之製作\論文人生\紅外線\red_coding main\picutre02\test03.jpg")
+img = Image.open(r"D:\Users\wedke\document\extra document\大三上\113專題研究之製作\論文人生\紅外線\red_coding main\picutre03\test03.jpg")
 
 # === 2. 設定基本參數 ===
 target_ratio = 2.0 / 1.5  # 高寬比 (1.33:1)
-min_w, min_h = 450, 600   # 最小像素
+min_w, min_h = 400, 500   # 最小像素
 dpi_setting = (500, 500)  # DPI 設為 300，可改 500
 
 # === 3. 調整比例 (裁切為 1.33:1) ===
@@ -25,7 +25,7 @@ elif current_ratio < target_ratio:
 
 # === 4. 調整大小 (至少 450×600 像素) ===
 # 以 450×600 為基準放大或縮小
-target_size = (450, 600)
+target_size = (400, 500)
 img = img.resize(target_size, Image.LANCZOS)
 
 # === 5. 若要灰階或彩色，可切換模式 ===
