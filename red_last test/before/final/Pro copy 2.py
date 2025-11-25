@@ -1,0 +1,837 @@
+import pandas as pd
+import numpy as np
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+from sklearn.model_selection import cross_val_score, GridSearchCV, KFold
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from scipy.stats import chi2
+import matplotlib.pyplot as plt
+from sklearn.metrics import pairwise_distances
+import time
+import xlsxwriter
+import random
+from adjustText import adjust_text
+
+# 設置 Times New Roman 字體
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.size'] = 12
+
+# 自定義 R² 計算函數，處理變異為零的情況
+def safe_r2_score(y_true, y_pred):
+    if len(y_true) <= 1 or np.var(y_true) == 0:
+        return 0.0
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    return 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+# 中心化（Centering）預處理函數
+def center(X):
+    X = np.array(X)
+    means = np.mean(X, axis=1, keepdims=True)
+    X_centered = X - means
+    return X_centered
+
+# UVE 波長選擇函數
+def uve_wavelength_selection(X, y, n_components, n_noise_vars=500, cv_folds=5):
+    n_samples, n_features = X.shape
+    noise = np.random.normal(0, 1e-6, size=(n_samples, n_noise_vars))
+    X_augmented = np.hstack((X, noise))
+    pls = PLSRegression(n_components=n_components)
+    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    coefs = np.zeros((cv_folds, X_augmented.shape[1]))
+    
+    for fold, (train_idx, _) in enumerate(kf.split(X_augmented)):
+        X_train = X_augmented[train_idx]
+        y_train = y[train_idx]
+        pls.fit(X_train, y_train)
+        coefs[fold] = pls.coef_.ravel()
+    
+    mean_coefs = np.mean(coefs, axis=0)
+    std_coefs = np.std(coefs, axis=0)
+    stability = np.abs(mean_coefs) / (std_coefs + 1e-10)
+    stability_real = stability[:n_features]
+    stability_noise = stability[n_features:]
+    threshold = np.percentile(stability_noise, 80)
+    selected_indices = np.where(stability_real > threshold)[0]
+    print(f"✅ UVE 選擇了 {len(selected_indices)} 個波長（共 {n_features} 個波長）")
+    return selected_indices
+
+# XGBoost 特徵重要性篩選函數
+def xgb_feature_selection(X_train, Y_train, X_test, n_features_to_select=100):
+    model = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        n_estimators=20,
+        max_depth=2,
+        learning_rate=0.1,
+        random_state=42
+    )
+    model.fit(X_train, Y_train)
+    importance = model.feature_importances_
+    sorted_idx = np.argsort(importance)[::-1][:n_features_to_select]
+    X_train_selected = X_train.iloc[:, sorted_idx]
+    X_test_selected = X_test.iloc[:, sorted_idx]
+    print(f"✅ XGBoost 特徵選擇後保留 {n_features_to_select} 個波長")
+    return X_train_selected, X_test_selected, sorted_idx
+
+# === 模型參數定義 ===
+PARAMS = {
+    'PLS': {
+        'WAVELENGTH_RANGE': (600, 1099.5),
+        'WAVELENGTH_RANGE_STR': '600-1099.5',
+        'MCS_N_ITERATIONS': 1000,
+        'MCS_N_COMPONENTS': 7,
+        'MAHALANOBIS_THRESHOLD': 75,
+        'TRAIN_TEST_RATIO': 0.2,
+        'TRAIN_TEST_RATIO_STR': '80:20',
+        'UVE_NOISE_VARIABLES': 500,
+        'UVE_CV_FOLDS': 5
+    },
+    'DT': {
+        'WAVELENGTH_RANGE': (600, 1099.5),
+        'WAVELENGTH_RANGE_STR': '600-1099.5',
+        'MCS_N_ITERATIONS': 1000,
+        'MCS_N_COMPONENTS': 7,
+        'MAHALANOBIS_THRESHOLD': 75,
+        'TRAIN_TEST_RATIO': 0.2,
+        'TRAIN_TEST_RATIO_STR': '80:20',
+        'MAX_DEPTH_RANGE': [20, 30],
+        'MIN_SAMPLES_SPLIT_RANGE': [2, 3, 5]
+    },
+    'SVM': {
+        'WAVELENGTH_RANGE': (600, 1099.5),
+        'WAVELENGTH_RANGE_STR': '600-1099.5',
+        'MCS_N_ITERATIONS': 1000,
+        'MCS_N_COMPONENTS': 10,
+        'MAHALANOBIS_THRESHOLD': 75,
+        'TRAIN_TEST_RATIO': 0.2,
+        'TRAIN_TEST_RATIO_STR': '80:20',
+        'SVR_C_RANGE': [10, 100, 500, 1000, 2000, 5000],
+        'SVR_EPSILON_RANGE': [0.001, 0.01, 0.1]
+    },
+    'RF': {
+        'WAVELENGTH_RANGE': (600, 1099.5),
+        'WAVELENGTH_RANGE_STR': '600-1099.5',
+        'MCS_N_ITERATIONS': 200,
+        'MCS_N_COMPONENTS': 7,
+        'MAHALANOBIS_THRESHOLD': 75,
+        'TRAIN_TEST_RATIO': 0.2,
+        'TRAIN_TEST_RATIO_STR': '80:20',
+        'MAX_DEPTH_RANGE': [3, 5, 7],
+        'MIN_SAMPLES_SPLIT_RANGE': [5, 10],
+        'N_ESTIMATORS_RANGE': [50, 100],
+        'MAX_FEATURES_RANGE': ['sqrt', 'log2']
+    },
+    'XGB': {
+        'WAVELENGTH_RANGE': (600, 1099.5),
+        'WAVELENGTH_RANGE_STR': '600-1099.5',
+        'MCS_N_ITERATIONS': 1000,
+        'MCS_N_COMPONENTS': 7,
+        'MAHALANOBIS_THRESHOLD': 75,
+        'TRAIN_TEST_RATIO': 0.2,
+        'TRAIN_TEST_RATIO_STR': '80:20',
+        'N_ESTIMATORS_RANGE': [50, 100, 200],
+        'LEARNING_RATE_RANGE': [0.5],
+        'MAX_DEPTH': 5,
+        'MIN_CHILD_WEIGHT_RANGE': [3, 5, 7, 10],
+        'SUBSAMPLE': 0.8,
+        'COLSAMPLE_BYTREE': 0.8,
+        'REG_ALPHA': 0.1,
+        'REG_LAMBDA': 1.0,
+        'UVE_NOISE_VARIABLES': 500,
+        'UVE_CV_FOLDS': 5,
+        'N_FEATURES_TO_SELECT': 150
+    }
+}
+
+# === 步驟 1: 數據獲取與處理 ===
+try:
+    nir_df = pd.read_csv(r'D:\meta\nir_data.csv')
+    print("✅ nir_data.csv 前五行:")
+    print(nir_df.head())
+except FileNotFoundError:
+    print("❌ 無法找到 nir_data.csv，請確認路徑。")
+    exit()
+
+try:
+    trad_df = pd.read_excel(r'D:\meta\trad_data.xlsx')
+    print("\n✅ trad_data.xlsx 前五行:")
+    print(trad_df.head())
+except FileNotFoundError:
+    print("❌ 無法找到 trad_data.xlsx，請確認路徑。")
+    exit()
+
+component = 'fat'
+
+print("\n🔍 NIR 缺失值檢查:\n", nir_df.isnull().sum())
+print("\n🔍 傳統分析缺失值檢查:\n", trad_df.isnull().sum())
+
+def find_sample_column(df, name='nir'):
+    for col in df.columns:
+        if 'sample number' in col.lower() or 'sample no' in col.lower():
+            print(f"✅ 在 {name} 資料中找到樣本編號欄位: {col}")
+            return col
+    print(f"⚠️ {name} 資料中未找到樣本編號欄位")
+    return None
+
+nir_sample_col = find_sample_column(nir_df, 'NIR')
+trad_sample_col = find_sample_column(trad_df, '傳統分析')
+
+if not nir_sample_col:
+    nir_sample_col = 'Sample_Number'
+    nir_df[nir_sample_col] = [f'1-{i+1}' for i in range(len(nir_df))]
+
+nir_df.columns = ['Wavelength'] + [f'1-{i}' for i in range(1, len(nir_df.columns))]
+nir_df = nir_df.drop(0).reset_index(drop=True)
+nir_df['Wavelength'] = nir_df['Wavelength'].astype(float)
+
+wavelength_range = PARAMS['PLS']['WAVELENGTH_RANGE']
+nir_filtered_df = nir_df[(nir_df['Wavelength'] >= wavelength_range[0]) & 
+                         (nir_df['Wavelength'] <= wavelength_range[1])]
+selected_columns = ['Wavelength'] + [col for col in nir_df.columns if col != 'Wavelength']
+nir_final_df = nir_filtered_df[selected_columns]
+print(f"✅ 過濾後 NIR 數據波長範圍: {nir_final_df['Wavelength'].min()} - {nir_final_df['Wavelength'].max()}, 共 {len(nir_final_df)} 個波長點")
+
+expected_wavelength_points = 500
+if len(nir_final_df) != expected_wavelength_points:
+    print(f"⚠️ 波長點數 {len(nir_final_df)} 不等於預期 {expected_wavelength_points}，請檢查數據格式")
+
+nir_df = nir_final_df
+
+if trad_sample_col:
+    trad_df[trad_sample_col] = [f'1-{i+1}' for i in range(len(trad_df))]
+else:
+    print("⚠️ 無法進行樣本對齊，缺少樣本編號欄")
+    exit()
+
+if component in trad_df.columns:
+    trad_df = trad_df.dropna(subset=[component])
+    Y = trad_df[component].values
+    print(f"\n🎯 {component} 目標值 Y 前五筆:", Y[:5])
+    print(f"\n🎯 {component} 目標值 Y 描述:", pd.Series(Y).describe())
+else:
+    print(f"❌ 缺少 '{component}' 欄位，無法建立模型")
+    exit()
+
+nir_transposed_df = nir_df.set_index('Wavelength').T
+nir_transposed_df = nir_transposed_df.apply(pd.to_numeric, errors='coerce')
+nir_transposed_df = nir_transposed_df.dropna(axis=1)
+print("\n✅ 轉換後 NIR 資料形狀:", nir_transposed_df.shape)
+
+sample_ids = trad_df[trad_sample_col].astype(str).tolist()
+nir_transposed_df.index = nir_transposed_df.index.astype(str)
+common_ids = list(set(sample_ids).intersection(set(nir_transposed_df.index)))
+if len(common_ids) != len(sample_ids) or len(common_ids) != len(Y):
+    print(f"❌ 對齊後樣本數不一致：X: {len(common_ids)}, Y: {len(Y)}")
+    trad_df = trad_df[trad_df[trad_sample_col].astype(str).isin(common_ids)]
+    Y = trad_df[component].values
+    X = nir_transposed_df.loc[common_ids]
+else:
+    X = nir_transposed_df.loc[sample_ids]
+print(f"✅ 成功對齊資料，樣本數: {X.shape[0]}")
+
+# === 步驟 2: 去除異常值 ===
+pca = PCA(n_components=min(X.shape[0], X.shape[1], 20))
+X_pca = pca.fit_transform(X)
+print(f"✅ PCA 降維後資料形狀: {X_pca.shape}")
+
+def mahalanobis_distance(X):
+    cov_matrix = np.cov(X, rowvar=False)
+    cov_matrix += np.eye(cov_matrix.shape[0]) * 1e-6
+    try:
+        cov_inv = np.linalg.inv(cov_matrix)
+    except np.linalg.LinAlgError:
+        print("❌ 協方差矩陣無法求逆，嘗試進一步正則化")
+        cov_matrix += np.eye(cov_matrix.shape[0]) * 1e-3
+        cov_inv = np.linalg.inv(cov_matrix)
+    mean = np.mean(X, axis=0)
+    md = np.sqrt(np.sum((X - mean) @ cov_inv * (X - mean), axis=1))
+    return md
+
+n_simulations = PARAMS['PLS']['MCS_N_ITERATIONS']
+np.random.seed(42)
+md_thresholds = []
+for _ in range(n_simulations):
+    sim_data = np.random.multivariate_normal(np.mean(X_pca, axis=0), np.cov(X_pca, rowvar=False), size=X_pca.shape[0])
+    cov_sim = np.cov(sim_data, rowvar=False)
+    if np.any(np.isnan(cov_sim)) or np.any(np.isinf(cov_sim)):
+        print("⚠️ 模擬數據協方差矩陣包含無效值")
+        continue
+    md_sim = mahalanobis_distance(sim_data)
+    md_thresholds.append(np.percentile(md_sim, PARAMS['PLS']['MAHALANOBIS_THRESHOLD']))
+md_threshold = np.mean(md_thresholds)
+
+md = mahalanobis_distance(X_pca)
+mask_md = md < md_threshold
+outliers_md = np.where(~mask_md)[0]
+print(f"✅ 馬氏距離法檢測到 {np.sum(~mask_md)} 個異常值，剩餘樣本數：{np.sum(mask_md)}")
+
+random.seed(42)
+all_outlier_indices = set(outliers_md)
+labels = random.sample(range(10, 100), len(all_outlier_indices))
+outlier_labels = {idx: label for idx, label in zip(all_outlier_indices, labels)}
+
+md_data = pd.DataFrame({
+    'Sample_Index': range(len(md)),
+    'Mahalanobis_Distance': md,
+    'Is_Outlier': md >= md_threshold,
+    'Label': [outlier_labels.get(idx, '') for idx in range(len(md))]
+})
+try:
+    with pd.ExcelWriter('outlier_detection_md.xlsx', engine='xlsxwriter') as writer:
+        workbook = writer.book
+        format_num = workbook.add_format({'num_format': '0.0000'})
+        format_header = workbook.add_format({'bold': True, 'align': 'center', 'border': 1})
+        
+        md_data.to_excel(writer, sheet_name='Mahalanobis_Distance', index=False)
+        
+        worksheet = writer.sheets['Mahalanobis_Distance']
+        worksheet.write(0, 0, 'Sample Index', format_header)
+        worksheet.write(0, 1, 'Mahalanobis Distance', format_header)
+        worksheet.write(0, 2, 'Is Outlier', format_header)
+        worksheet.write(0, 3, 'Label', format_header)
+        worksheet.set_column('A:A', 12)
+        worksheet.set_column('B:B', 20, format_num)
+        worksheet.set_column('C:C', 10)
+        worksheet.set_column('D:D', 10)
+    print(f"✅ 馬氏距離數據已儲存至 'outlier_detection_md.xlsx'")
+except Exception as e:
+    print(f"❌ 儲存 'outlier_detection_md.xlsx' 時發生錯誤: {e}")
+
+print("\n馬氏距離法參數:")
+print(f"MCS_N_ITERATIONS: {PARAMS['PLS']['MCS_N_ITERATIONS']}")
+print(f"MAHALANOBIS_THRESHOLD: {PARAMS['PLS']['MAHALANOBIS_THRESHOLD']}%")
+print(f"計算所得閾值: {md_threshold:.2f}")
+
+plt.figure(figsize=(10, 6))
+plt.scatter(range(len(md)), md, color='blue', label='Mahalanobis Distance')
+plt.axhline(y=md_threshold, color='red', linestyle='--', label=f'Threshold = {md_threshold:.2f}')
+texts = []
+for i, idx in enumerate(outliers_md):
+    plt.scatter(idx, md[idx], color='red', label=f'Outlier {outlier_labels[idx]}' if i == 0 else None)
+    text = plt.annotate(outlier_labels[idx], (idx, md[idx]), textcoords="offset points", 
+                        xytext=(0,10), ha='center', 
+                        arrowprops=dict(arrowstyle='->', connectionstyle='arc3'))
+    texts.append(text)
+adjust_text(texts, arrowprops=dict(arrowstyle='->', color='black'))
+plt.xlabel('Sample Index')
+plt.ylabel('Mahalanobis Distance')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+ax = plt.gca()
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig('outlier_detection_md.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.scatter(X_pca[mask_md, 0], X_pca[mask_md, 1], color='green', label='Normal Samples')
+for i, idx in enumerate(outliers_md):
+    plt.scatter(X_pca[idx, 0], X_pca[idx, 1], color='red', label=f'Outlier {outlier_labels[idx]}' if i == 0 else None)
+    plt.annotate(outlier_labels[idx], (X_pca[idx, 0], X_pca[idx, 1]), textcoords="offset points", xytext=(0,10), ha='center')
+plt.title('PCA Scatter Plot with Mahalanobis Outliers\n' +
+          f'MCS_N_ITERATIONS: {PARAMS["PLS"]["MCS_N_ITERATIONS"]}, MAHALANOBIS_THRESHOLD: {PARAMS["PLS"]["MAHALANOBIS_THRESHOLD"]}%, Threshold: {md_threshold:.2f}')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True)
+plt.tight_layout()
+plt.savefig('outlier_detection_md_pca.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+def monte_carlo_outlier_detection(X, y, n_iterations=PARAMS['PLS']['MCS_N_ITERATIONS'], 
+                                 sample_ratio=0.8, n_components=PARAMS['PLS']['MCS_N_COMPONENTS'], 
+                                 threshold_percentile=95):
+    n_samples = X.shape[0]
+    n_subset = int(n_samples * sample_ratio)
+    residuals = np.zeros(n_samples)
+    
+    for _ in range(n_iterations):
+        indices = np.random.choice(n_samples, n_subset, replace=False)
+        X_subset = X.iloc[indices] if isinstance(X, pd.DataFrame) else X[indices]
+        y_subset = y[indices]
+        scaler = StandardScaler()
+        X_subset_scaled = scaler.fit_transform(X_subset)
+        pls = PLSRegression(n_components=min(n_components, X_subset_scaled.shape[1], n_subset))
+        pls.fit(X_subset_scaled, y_subset)
+        X_scaled = scaler.transform(X)
+        y_pred = pls.predict(X_scaled).ravel()
+        residuals += (y - y_pred) ** 2
+    
+    residuals = residuals / n_iterations
+    threshold = np.percentile(residuals, threshold_percentile)
+    mask_mcs = residuals < threshold
+    print(f"✅ MCS 檢測到 {np.sum(~mask_mcs)} 個異常值，剩餘樣本數：{np.sum(mask_mcs)}")
+    return mask_mcs, residuals, threshold
+
+# 結合馬氏距離和 MCS（交集）
+scaler_y_temp = StandardScaler()
+Y_scaled_temp = scaler_y_temp.fit_transform(Y.reshape(-1, 1)).ravel()
+mask_mcs, residuals_mcs, mcs_threshold = monte_carlo_outlier_detection(X, Y_scaled_temp)
+mask = mask_md & mask_mcs
+X = X[mask]
+Y = Y[mask]
+print(f"✅ 結合馬氏距離和 MCS 後，剩餘樣本數：{X.shape[0]}")
+print(f"✅ 剔除後目標值 Y 描述:", pd.Series(Y).describe())
+
+outliers_mcs = np.where(~mask_mcs)[0]
+new_outliers = [idx for idx in outliers_mcs if idx not in outlier_labels]
+if new_outliers:
+    random.seed(42)
+    new_labels = random.sample([i for i in range(10, 100) if i not in outlier_labels.values()], len(new_outliers))
+    outlier_labels.update({idx: label for idx, label in zip(new_outliers, new_labels)})
+
+outliers_combined = np.where(~mask)[0]
+
+mcs_data = pd.DataFrame({
+    'Sample_Index': range(len(residuals_mcs)),
+    'Average_Residual': residuals_mcs,
+    'Is_Outlier': residuals_mcs >= mcs_threshold,
+    'Label': [outlier_labels.get(idx, '') for idx in range(len(residuals_mcs))]
+})
+try:
+    with pd.ExcelWriter('outlier_detection_mcs.xlsx', engine='xlsxwriter') as writer:
+        workbook = writer.book
+        format_num = workbook.add_format({'num_format': '0.0000'})
+        format_header = workbook.add_format({'bold': True, 'align': 'center', 'border': 1})
+        
+        mcs_data.to_excel(writer, sheet_name='MCS_Residuals', index=False)
+        
+        worksheet = writer.sheets['MCS_Residuals']
+        worksheet.write(0, 0, 'Sample Index', format_header)
+        worksheet.write(0, 1, 'Average Residual', format_header)
+        worksheet.write(0, 2, 'Is Outlier', format_header)
+        worksheet.write(0, 3, 'Label', format_header)
+        worksheet.set_column('A:A', 12)
+        worksheet.set_column('B:B', 20, format_num)
+        worksheet.set_column('C:C', 10)
+        worksheet.set_column('D:D', 10)
+    print(f"✅ MCS 殞差數據已儲存至 'outlier_detection_mcs.xlsx'")
+except Exception as e:
+    print(f"❌ 儲存 'outlier_detection_mcs.xlsx' 時發生錯誤: {e}")
+
+print("\n異常值標號與數量:")
+print(f"馬氏距離異常值 (共 {len(outliers_md)} 個): {[outlier_labels[idx] for idx in outliers_md]}")
+print(f"MCS 異常值 (共 {len(outliers_mcs)} 個): {[outlier_labels[idx] for idx in outliers_mcs]}")
+print(f"重合異常值 (共 {len(outliers_combined)} 個): {[outlier_labels[idx] for idx in outliers_combined]}")
+
+print("\nMCS法參數:")
+print(f"MCS_N_ITERATIONS: {PARAMS['PLS']['MCS_N_ITERATIONS']}")
+print(f"MCS_N_COMPONENTS: {PARAMS['PLS']['MCS_N_COMPONENTS']}")
+print(f"Threshold Percentile: 95%")
+print(f"計算所得閾值: {mcs_threshold:.2f}")
+
+plt.figure(figsize=(10, 6))
+plt.scatter(range(len(residuals_mcs)), residuals_mcs, color='blue', label='MCS Residuals')
+plt.axhline(y=mcs_threshold, color='red', linestyle='--', label=f'Threshold = {mcs_threshold:.2f}')
+texts = []
+for i, idx in enumerate(outliers_mcs):
+    plt.scatter(idx, residuals_mcs[idx], color='red', label=f'Outlier {outlier_labels[idx]}' if i == 0 else None)
+    text = plt.annotate(outlier_labels[idx], (idx, residuals_mcs[idx]), textcoords="offset points", 
+                        xytext=(0,10), ha='center', 
+                        arrowprops=dict(arrowstyle='->', connectionstyle='arc3'))
+    texts.append(text)
+adjust_text(texts, arrowprops=dict(arrowstyle='->', color='black'))
+plt.xlabel('Sample Index')
+plt.ylabel('Average Residual')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+ax = plt.gca()
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig('outlier_detection_mcs.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.scatter(X_pca[mask_mcs, 0], X_pca[mask_mcs, 1], color='green', label='Normal Samples')
+for i, idx in enumerate(outliers_mcs):
+    plt.scatter(X_pca[idx, 0], X_pca[idx, 1], color='red', label=f'Outlier {outlier_labels[idx]}' if i == 0 else None)
+    plt.annotate(outlier_labels[idx], (X_pca[idx, 0], X_pca[idx, 1]), textcoords="offset points", xytext=(0,10), ha='center')
+plt.title('PCA Scatter Plot with MCS Outliers\n' +
+          f'MCS_N_ITERATIONS: {PARAMS["PLS"]["MCS_N_ITERATIONS"]}, MCS_N_COMPONENTS: {PARAMS["PLS"]["MCS_N_COMPONENTS"]}, Threshold Percentile: 95%, Threshold: {mcs_threshold:.2f}')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True)
+plt.tight_layout()
+plt.savefig('outlier_detection_mcs_pca.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.scatter(X_pca[mask, 0], X_pca[mask, 1], color='green', label='Normal Samples')
+for i, idx in enumerate(outliers_combined):
+    plt.scatter(X_pca[idx, 0], X_pca[idx, 1], color='red', label=f'Outlier {outlier_labels.get(idx, random.randint(10, 99))}' if i == 0 else None)
+    plt.annotate(outlier_labels.get(idx, random.randint(10, 99)), (X_pca[idx, 0], X_pca[idx, 1]), textcoords="offset points", xytext=(0,10), ha='center')
+plt.title('PCA Scatter Plot with Combined (MD & MCS) Outliers\n' +
+          f'MD Threshold: {md_threshold:.2f}, MCS Threshold: {mcs_threshold:.2f}')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True)
+plt.tight_layout()
+plt.savefig('outlier_detection_combined_pca.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\n結合方法參數:")
+print(f"馬氏距離閾值: {md_threshold:.2f}")
+print(f"MCS殞差閾值: {mcs_threshold:.2f}")
+
+# === 步驟 3: NIR 光譜標準化 ===
+scaler_y = StandardScaler()
+Y_scaled = scaler_y.fit_transform(Y.reshape(-1, 1)).ravel()
+
+# 儲存結果的字典
+results = {}
+predictions = {}
+
+for model_name in ['PLS', 'DT', 'SVM', 'RF', 'XGB']:
+    params = PARAMS[model_name]
+    
+    # 標準化
+    scaler_x = StandardScaler()
+    X_scaled = scaler_x.fit_transform(X)
+    X_processed = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+    print(f"✅ {model_name} NIR 光譜標準化完成")
+
+    # === 步驟 4: 分配樣本集 (SPXY) ===
+    def spxy(X, Y, test_size=params['TRAIN_TEST_RATIO']):
+        if isinstance(X, pd.DataFrame):
+            indices = X.index
+            columns = X.columns
+            X = np.array(X)
+        else:
+            indices = np.arange(X.shape[0])
+            columns = None
+        
+        Y = np.array(Y).reshape(-1, 1)
+        n_samples = X.shape[0]
+        n_test = int(np.floor(test_size * n_samples))
+
+        dist_X = pairwise_distances(X)
+        dist_Y = pairwise_distances(Y)
+        dist_XY = dist_X + dist_Y
+
+        selected = []
+        remaining = list(range(n_samples))
+
+        i1, i2 = np.unravel_index(np.argmax(dist_XY), dist_XY.shape)
+        selected.extend([i1, i2])
+        remaining.remove(i1)
+        remaining.remove(i2)
+
+        while len(selected) < n_samples - n_test:
+            min_distances = np.min(dist_XY[remaining][:, selected], axis=1)
+            next_index = remaining[np.argmax(min_distances)]
+            selected.append(next_index)
+            remaining.remove(next_index)
+
+        selected = np.array(selected)
+        remaining = np.array(remaining)
+
+        X_train = X[selected]
+        Y_train = Y[selected].ravel()
+        X_test = X[remaining]
+        Y_test = Y[remaining].ravel()
+
+        X_train = pd.DataFrame(X_train, index=indices[selected], columns=columns)
+        X_test = pd.DataFrame(X_test, index=indices[remaining], columns=columns)
+
+        # 計算校正集和驗證集的統計指標
+        Y_train_original = scaler_y.inverse_transform(Y_train.reshape(-1, 1)).ravel()
+        Y_test_original = scaler_y.inverse_transform(Y_test.reshape(-1, 1)).ravel()
+        
+        train_stats = {
+            'Sample_Count': len(Y_train_original),
+            'Max': np.max(Y_train_original),
+            'Min': np.min(Y_train_original),
+            'Mean': np.mean(Y_train_original),
+            'Std': np.std(Y_train_original)
+        }
+        test_stats = {
+            'Sample_Count': len(Y_test_original),
+            'Max': np.max(Y_test_original),
+            'Min': np.min(Y_test_original),
+            'Mean': np.mean(Y_test_original),
+            'Std': np.std(Y_test_original)
+        }
+
+        print(f"\n✅ {model_name} 校正集（訓練集）蛋白質含量統計:")
+        print(f"樣本數: {train_stats['Sample_Count']}")
+        print(f"最大值: {train_stats['Max']:.4f}")
+        print(f"最小值: {train_stats['Min']:.4f}")
+        print(f"平均值: {train_stats['Mean']:.4f}")
+        print(f"標準差: {train_stats['Std']:.4f}")
+        print(f"✅ {model_name} 驗證集（測試集）蛋白質含量統計:")
+        print(f"樣本數: {test_stats['Sample_Count']}")
+        print(f"最大值: {test_stats['Max']:.4f}")
+        print(f"最小值: {test_stats['Min']:.4f}")
+        print(f"平均值: {test_stats['Mean']:.4f}")
+        print(f"標準差: {test_stats['Std']:.4f}")
+
+        print(f"✅ {model_name} 訓練集 {component} 描述:", pd.Series(Y_train_original).describe())
+        print(f"✅ {model_name} 測試集 {component} 描述:", pd.Series(Y_test_original).describe())
+
+        stats_df = pd.DataFrame({
+            'Dataset': ['Calibration (Train)', 'Validation (Test)'],
+            'Sample_Count': [train_stats['Sample_Count'], test_stats['Sample_Count']],
+            'Max': [train_stats['Max'], test_stats['Max']],
+            'Min': [train_stats['Min'], test_stats['Min']],
+            'Mean': [train_stats['Mean'], test_stats['Mean']],
+            'Std': [train_stats['Std'], test_stats['Std']]
+        })
+        
+        try:
+            with pd.ExcelWriter(f'{model_name}_SPXY_Statistics.xlsx', engine='xlsxwriter') as writer:
+                workbook = writer.book
+                format_num = workbook.add_format({'num_format': '0.0000'})
+                format_header = workbook.add_format({'bold': True, 'align': 'center', 'border': 1})
+                
+                stats_df.to_excel(writer, sheet_name='SPXY_Statistics', index=False)
+                
+                worksheet = writer.sheets['SPXY_Statistics']
+                worksheet.write(0, 0, 'Dataset', format_header)
+                worksheet.write(0, 1, 'Sample_Count', format_header)
+                worksheet.write(0, 2, 'Max', format_header)
+                worksheet.write(0, 3, 'Min', format_header)
+                worksheet.write(0, 4, 'Mean', format_header)
+                worksheet.write(0, 5, 'Std', format_header)
+                worksheet.set_column('A:A', 20)
+                worksheet.set_column('B:B', 12, format_num)
+                worksheet.set_column('C:C', 12, format_num)
+                worksheet.set_column('D:D', 12, format_num)
+                worksheet.set_column('E:E', 12, format_num)
+                worksheet.set_column('F:F', 12, format_num)
+            
+            print(f"✅ {model_name} SPXY 統計數據已儲存至 {model_name}_SPXY_Statistics.xlsx")
+        except Exception as e:
+            print(f"❌ 儲存 {model_name}_SPXY_Statistics.xlsx 時發生錯誤: {e}")
+
+        return X_train, X_test, Y_train, Y_test
+
+    Y_scaled_filtered = scaler_y.transform(Y.reshape(-1, 1)).ravel()
+    X_train, X_test, Y_train, Y_test = spxy(X_processed, Y_scaled_filtered)
+    print(f"✅ {model_name} SPXY 訓練集形狀: {X_train.shape}, 測試集形狀: {X_test.shape}")
+
+    # === 步驟 5: 光譜中心化處理 ===
+    X_train_centered = center(X_train)
+    X_train = pd.DataFrame(X_train_centered, index=X_train.index, columns=X_train.columns)
+    X_test_centered = center(X_test)
+    X_test = pd.DataFrame(X_test_centered, index=X_test.index, columns=X_test.columns)
+    print(f"✅ {model_name} NIR 光譜中心化完成")
+
+    # === 步驟 6: 特徵選擇與模型訓練 ===
+    if model_name in ['PLS', 'XGB']:
+        selected_wavelength_indices = uve_wavelength_selection(X_train.values, Y_train, 
+                                                              n_components=params['MCS_N_COMPONENTS'],
+                                                              n_noise_vars=params.get('UVE_NOISE_VARIABLES', 500),
+                                                              cv_folds=params.get('UVE_CV_FOLDS', 5))
+        wavelengths = nir_final_df['Wavelength'].values
+        selected_wavelengths = wavelengths[selected_wavelength_indices]
+        X_train_selected = X_train.iloc[:, selected_wavelength_indices]
+        X_test_selected = X_test.iloc[:, selected_wavelength_indices]
+        print(f"✅ {model_name} UVE 波長選擇後，訓練集形狀: {X_train_selected.shape}, 測試集形狀: {X_test_selected.shape}")
+    else:
+        X_train_selected = X_train
+        X_test_selected = X_test
+
+    if model_name == 'XGB':
+        X_train_selected, X_test_selected, selected_idx = xgb_feature_selection(
+            X_train_selected, Y_train, X_test_selected, n_features_to_select=params['N_FEATURES_TO_SELECT']
+        )
+        selected_wavelengths = selected_wavelengths[selected_idx]
+        print(f"✅ {model_name} 最終特徵數: {X_train_selected.shape[1]}")
+
+    if model_name == 'PLS':
+        param_grid = {
+            'n_components': range(2, min(X_train_selected.shape[1], 20) + 1)
+        }
+        model = PLSRegression()
+        grid_search = GridSearchCV(model, param_grid, cv=KFold(n_splits=3, shuffle=True, random_state=42),
+                                  scoring='r2', n_jobs=-1, refit=True, error_score='raise')
+    elif model_name == 'DT':
+        param_grid = {
+            'max_depth': params['MAX_DEPTH_RANGE'],
+            'min_samples_split': params['MIN_SAMPLES_SPLIT_RANGE']
+        }
+        model = DecisionTreeRegressor(random_state=42)
+        grid_search = GridSearchCV(model, param_grid, cv=5, scoring='r2', n_jobs=-1, refit=True, error_score='raise')
+    elif model_name == 'SVM':
+        param_grid = {
+            'C': params['SVR_C_RANGE'],
+            'epsilon': params['SVR_EPSILON_RANGE']
+        }
+        model = SVR(kernel='rbf', gamma='scale')
+        grid_search = GridSearchCV(model, param_grid, cv=5, scoring='r2', n_jobs=-1, refit=True, error_score='raise')
+    elif model_name == 'RF':
+        param_grid = {
+            'max_depth': params['MAX_DEPTH_RANGE'],
+            'min_samples_split': params['MIN_SAMPLES_SPLIT_RANGE'],
+            'n_estimators': params['N_ESTIMATORS_RANGE'],
+            'max_features': params['MAX_FEATURES_RANGE']
+        }
+        model = RandomForestRegressor(random_state=42)
+        grid_search = GridSearchCV(model, param_grid, cv=3, scoring='r2', n_jobs=-1, refit=True, error_score='raise')
+    else:
+        param_grid = {
+            'n_estimators': params['N_ESTIMATORS_RANGE'],
+            'learning_rate': params['LEARNING_RATE_RANGE'],
+            'min_child_weight': params['MIN_CHILD_WEIGHT_RANGE']
+        }
+        model = xgb.XGBRegressor(
+            objective='reg:squarederror',
+            max_depth=params['MAX_DEPTH'],
+            subsample=params['SUBSAMPLE'],
+            colsample_bytree=params['COLSAMPLE_BYTREE'],
+            reg_alpha=params['REG_ALPHA'],
+            reg_lambda=params['REG_LAMBDA'],
+            random_state=42
+        )
+        grid_search = GridSearchCV(model, param_grid, cv=3, scoring='r2', n_jobs=-1, refit=True, error_score='raise')
+
+    start_time = time.time()
+    grid_search.fit(X_train_selected, Y_train)
+    train_time = time.time() - start_time
+    print(f"✅ {model_name} 模型訓練完成，最佳參數: {grid_search.best_params_}, 訓練時間: {train_time:.2f} 秒")
+
+    start_pred_time = time.time()
+    Y_train_pred = grid_search.predict(X_train_selected)
+    Y_test_pred = grid_search.predict(X_test_selected)
+    pred_time = time.time() - start_pred_time
+    Y_train_pred_original = scaler_y.inverse_transform(Y_train_pred.reshape(-1, 1)).ravel()
+    Y_test_pred_original = scaler_y.inverse_transform(Y_test_pred.reshape(-1, 1)).ravel()
+    Y_train_original = scaler_y.inverse_transform(Y_train.reshape(-1, 1)).ravel()
+    Y_test_original = scaler_y.inverse_transform(Y_test.reshape(-1, 1)).ravel()
+
+    train_mse = mean_squared_error(Y_train_original, Y_train_pred_original)
+    test_mse = mean_squared_error(Y_test_original, Y_test_pred_original)
+    train_rmse = np.sqrt(train_mse)
+    test_rmse = np.sqrt(test_mse)
+    train_r2 = safe_r2_score(Y_train_original, Y_train_pred_original)
+    test_r2 = safe_r2_score(Y_test_original, Y_test_pred_original)
+    sec = np.sqrt(np.sum((Y_train_original - Y_train_pred_original) ** 2) / max(1, len(Y_train) - 1))
+    sep = np.sqrt(np.sum((Y_test_original - Y_test_pred_original) ** 2) / (len(Y_test) - 1))
+
+    cv_scores = cross_val_score(grid_search.best_estimator_, X_train_selected, Y_train, cv=3, scoring='r2')
+    print(f"\n✅ {model_name} 3-fold Cross-Validation Mean R²: {cv_scores.mean():.4f} (± {cv_scores.std() * 2:.4f})")
+    print(f"✅ {model_name} Train RMSE: {train_rmse:.4f}, Test RMSE: {test_rmse:.4f}")
+    print(f"✅ {model_name} Train R²: {train_r2:.4f}, Test R²: {test_r2:.4f}")
+    print(f"✅ {model_name} SEC: {sec:.4f}, SEP: {sep:.4f}")
+
+    results[model_name] = {
+        'Train RMSE': train_rmse,
+        'Test RMSE': test_rmse,
+        'Train R²': train_r2,
+        'Test R²': test_r2,
+        'CV Mean R²': cv_scores.mean(),
+        'CV Std R²': cv_scores.std() * 2,
+        'SEC': sec,
+        'SEP': sep,
+        'Best Params': grid_search.best_params_,
+        'Train Time (s)': train_time,
+        'Pred Time (s)': pred_time,
+        'Unique Params': {k: v for k, v in params.items() if k not in ['MCS_N_ITERATIONS', 'MCS_N_COMPONENTS', 'MAHALANOBIS_THRESHOLD', 'TRAIN_TEST_RATIO']},
+        'Common Params': {
+            'MCS_N_ITERATIONS': params['MCS_N_ITERATIONS'],
+            'MCS_N_COMPONENTS': params['MCS_N_COMPONENTS'],
+            'MAHALANOBIS_THRESHOLD': params['MAHALANOBIS_THRESHOLD'],
+            'TRAIN_TEST_RATIO': params['TRAIN_TEST_RATIO']
+        }
+    }
+
+    predictions[model_name] = {
+        'Y_train_original': Y_train_original,
+        'Y_train_pred_original': Y_train_pred_original,
+        'Y_test_original': Y_test_original,
+        'Y_test_pred_original': Y_test_pred_original
+    }
+
+    # 繪製散點圖（包含校正集和驗證集）
+    plt.figure(figsize=(6, 6))
+    plt.scatter(Y_train_original, Y_train_pred_original, color='red', alpha=0.7, label='Calibration Set')
+    plt.scatter(Y_test_original, Y_test_pred_original, color='blue', alpha=0.7, label='Validation Set')
+    min_val = min(np.min(Y_train_original), np.min(Y_test_original))
+    max_val = max(np.max(Y_train_original), np.max(Y_test_original))
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Ideal (y=x)')
+    plt.xlabel(f'Actual {component} Content (%)')
+    plt.ylabel(f'Predicted {component} Content (%)')
+    plt.title(f'{model_name} Regression: Actual vs Predicted {component}')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'{model_name}_scatter_plot.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    print(f"✅ {model_name} 總訓練時間: {train_time:.2f} 秒，總預測時間: {pred_time:.2f} 秒")
+
+with pd.ExcelWriter('model_evaluation_results.xlsx', engine='xlsxwriter') as writer:
+    workbook = writer.book
+    format_num = workbook.add_format({'num_format': '0.0000'})
+    format_text = workbook.add_format({'text_wrap': True})
+    format_header = workbook.add_format({'bold': True, 'align': 'center', 'border': 1})
+
+    for model_name in ['PLS', 'DT', 'SVM', 'RF', 'XGB']:
+        df = pd.DataFrame({
+            'Metric': ['Train RMSE', 'Test RMSE', 'Train R²', 'Test R²', 'CV Mean R²', 'CV Std R²', 'SEC', 'SEP', 'Train Time (s)', 'Pred Time (s)'],
+            'Value': [
+                results[model_name]['Train RMSE'],
+                results[model_name]['Test RMSE'],
+                results[model_name]['Train R²'],
+                results[model_name]['Test R²'],
+                results[model_name]['CV Mean R²'],
+                results[model_name]['CV Std R²'],
+                results[model_name]['SEC'],
+                results[model_name]['SEP'],
+                results[model_name]['Train Time (s)'],
+                results[model_name]['Pred Time (s)']
+            ]
+        })
+        df.to_excel(writer, sheet_name=model_name, index=False, startrow=1)
+
+        worksheet = writer.sheets[model_name]
+        worksheet.write(0, 0, f'{model_name} Model Evaluation', format_header)
+        worksheet.set_column('A:A', 15, format_text)
+        worksheet.set_column('B:B', 12, format_num)
+
+        param_df = pd.DataFrame({
+            'Parameter': ['Best Params'] + [f'Unique Params - {k}' for k in results[model_name]['Unique Params'].keys()] + [f'Common Params - {k}' for k in results[model_name]['Common Params'].keys()],
+            'Value': [str(results[model_name]['Best Params'])] + [str(v) for v in results[model_name]['Unique Params'].values()] + [str(v) for v in results[model_name]['Common Params'].values()]
+        })
+        param_df.to_excel(writer, sheet_name=model_name, startrow=len(df) + 3, index=False)
+
+        worksheet.write(len(df) + 2, 0, 'Parameters', format_header)
+        worksheet.set_column('A:A', 25, format_text)
+        worksheet.set_column('B:B', 20, format_text)
+
+print("✅ 評估指標和參數已儲存至 model_evaluation_results.xlsx")
+
+for model_name in ['PLS', 'DT', 'SVM', 'RF', 'XGB']:
+    # 合併校正集和驗證集數據
+    scatter_df = pd.DataFrame({
+        'Dataset': ['Calibration'] * len(predictions[model_name]['Y_train_original']) + ['Validation'] * len(predictions[model_name]['Y_test_original']),
+        'Actual': np.concatenate([predictions[model_name]['Y_train_original'], predictions[model_name]['Y_test_original']]),
+        'Predicted': np.concatenate([predictions[model_name]['Y_train_pred_original'], predictions[model_name]['Y_test_pred_original']])
+    })
+    
+    try:
+        with pd.ExcelWriter(f'{model_name}_Scatter_Data.xlsx', engine='xlsxwriter') as writer:
+            workbook = writer.book
+            format_num = workbook.add_format({'num_format': '0.0000'})
+            format_header = workbook.add_format({'bold': True, 'align': 'center', 'border': 1})
+            
+            scatter_df.to_excel(writer, sheet_name='Scatter_Data', index=False)
+            
+            worksheet = writer.sheets['Scatter_Data']
+            worksheet.write(0, 0, 'Dataset', format_header)
+            worksheet.write(0, 1, 'Actual', format_header)
+            worksheet.write(0, 2, 'Predicted', format_header)
+            worksheet.set_column('A:A', 15)
+            worksheet.set_column('B:B', 12, format_num)
+            worksheet.set_column('C:C', 12, format_num)
+        
+        print(f"✅ {model_name} 散點圖數據（包含校正集和驗證集）已儲存至 {model_name}_Scatter_Data.xlsx")
+    except Exception as e:
+        print(f"❌ 儲存 {model_name}_Scatter_Data.xlsx 時發生錯誤: {e}")
